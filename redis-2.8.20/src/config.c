@@ -502,6 +502,23 @@ void loadServerConfigFromString(char *config) {
                 err = sentinelHandleConfiguration(argv+1,argc-1);
                 if (err) goto loaderr;
             }
+        } else if (!strcasecmp(argv[0],"backup-hdfs-host")) {
+            zfree(server.backup_hdfs_host);
+            server.backup_hdfs_host = zstrdup(argv[1]);
+        }  else if (!strcasecmp(argv[0],"backup-hdfs-port")) {
+            server.backup_hdfs_port = atoi(argv[1]);
+        }  else if (!strcasecmp(argv[0],"backup-hdfs-user")) {
+            zfree(server.backup_hdfs_user);
+            server.backup_hdfs_user = zstrdup(argv[1]);
+        }  else if (!strcasecmp(argv[0],"backup-hdfs-path")) {
+            zfree(server.backup_hdfs_path);
+            server.backup_hdfs_path = zstrdup(argv[1]);
+        }   else if (!strcasecmp(argv[0],"backup-hdfs-enable")) {
+            int yes;
+            if ((yes = yesnotoi(argv[1])) == -1) {
+                err = "argument must be 'yes' or 'no'"; goto loaderr;
+            }
+            server.backup_hdfs_enable = yes ? REDIS_HDFS_ON : REDIS_HDFS_OFF;
         } else {
             err = "Bad directive or wrong number of arguments"; goto loaderr;
         }
@@ -902,6 +919,22 @@ void configSetCommand(redisClient *c) {
             ll < 0) goto badfmt;
         server.repl_min_slaves_max_lag = ll;
         refreshGoodSlavesCount();
+    } else if (!strcasecmp(c->argv[2]->ptr,"backup-hdfs-host")) {
+        zfree(server.backup_hdfs_host);
+        server.backup_hdfs_host = zstrdup(o->ptr);
+    } else if (!strcasecmp(c->argv[2]->ptr,"backup-hdfs-port")) {
+        if (getLongLongFromObject(o,&ll) == REDIS_ERR || ll <= 0) goto badfmt;
+        server.backup_hdfs_port = ll;
+    } else if (!strcasecmp(c->argv[2]->ptr,"backup-hdfs-user")) {
+        zfree(server.backup_hdfs_user);
+        server.backup_hdfs_user = zstrdup(o->ptr);
+    } else if (!strcasecmp(c->argv[2]->ptr,"backup-hdfs-path")) {
+        zfree(server.backup_hdfs_path);
+        server.backup_hdfs_path = zstrdup(o->ptr);
+    } else if (!strcasecmp(c->argv[2]->ptr,"backup-hdfs-enable")) {
+        int enable = yesnotoi(o->ptr);
+        if (enable == -1) goto badfmt;
+        server.aof_state = enable ? REDIS_HDFS_ON : REDIS_HDFS_OFF;
     } else {
         addReplyErrorFormat(c,"Unsupported CONFIG parameter: %s",
             (char*)c->argv[2]->ptr);
@@ -960,6 +993,9 @@ void configGetCommand(redisClient *c) {
     config_get_string_field("unixsocket",server.unixsocket);
     config_get_string_field("logfile",server.logfile);
     config_get_string_field("pidfile",server.pidfile);
+    config_get_string_field("backup-hdfs-host",server.backup_hdfs_host);
+    config_get_string_field("backup-hdfs-user",server.backup_hdfs_user);
+    config_get_string_field("backup-hdfs-path",server.backup_hdfs_path);
 
     /* Numerical values */
     config_get_numerical_field("maxmemory",server.maxmemory);
@@ -1007,6 +1043,7 @@ void configGetCommand(redisClient *c) {
     config_get_numerical_field("min-slaves-max-lag",server.repl_min_slaves_max_lag);
     config_get_numerical_field("hz",server.hz);
     config_get_numerical_field("repl-diskless-sync-delay",server.repl_diskless_sync_delay);
+    config_get_numerical_field("backup-hdfs-port",server.backup_hdfs_port);
 
     /* Bool (yes/no) values */
     config_get_bool_field("no-appendfsync-on-rewrite",
@@ -1029,6 +1066,8 @@ void configGetCommand(redisClient *c) {
             server.aof_rewrite_incremental_fsync);
     config_get_bool_field("aof-load-truncated",
             server.aof_load_truncated);
+    config_get_bool_field("backup-hdfs-enable",
+                          server.backup_hdfs_enable);
 
     /* Everything we can't handle with macros follows. */
 

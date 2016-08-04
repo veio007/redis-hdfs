@@ -30,6 +30,7 @@
 #include "redis.h"
 #include "bio.h"
 #include "rio.h"
+#include "hdfs.h"
 
 #include <signal.h>
 #include <fcntl.h>
@@ -56,6 +57,16 @@ void aofUpdateCurrentSize(void);
  * ------------------------------------------------------------------------- */
 
 #define AOF_RW_BUF_BLOCK_SIZE (1024*1024*10)    /* 10 MB per block */
+
+
+static inline size_t rioWriteRaw(rio *r, const void *buf, size_t len) {
+    if (r && rioWrite(r,buf,len) == 0)
+        return -1;
+
+    hdfs_write_raw(r, buf, len);
+    return len;
+}
+
 
 typedef struct aofrwblock {
     unsigned long used, free;
@@ -128,7 +139,7 @@ void aofRewriteBufferAppend(unsigned char *s, unsigned long len) {
 /* Write the buffer (possibly composed of multiple blocks) into the specified
  * fd. If a short write or any other error happens -1 is returned,
  * otherwise the number of bytes written is returned. */
-ssize_t aofRewriteBufferWrite(int fd) {
+ssize_t aofRewriteBufferWrite(int fd, hdfsFS fs, hdfsFile file) {
     listNode *ln;
     listIter li;
     ssize_t count = 0;
@@ -139,6 +150,11 @@ ssize_t aofRewriteBufferWrite(int fd) {
         ssize_t nwritten;
 
         if (block->used) {
+            if (fs != NULL && file != NULL) {
+                if (hdfs_write(fs, file, block->buf, block->used) < 0) {
+                    redisLog(REDIS_WARNING, "aofRewriteBufferWrite| hdfs write error, [%d]", errno);
+                }
+            }
             nwritten = write(fd,block->buf,block->used);
             if (nwritten != (ssize_t)block->used) {
                 if (nwritten == 0) errno = EIO;
@@ -167,6 +183,22 @@ void stopAppendOnly(void) {
     flushAppendOnlyFile(1);
     aof_fsync(server.aof_fd);
     close(server.aof_fd);
+
+    if (server.backup_hdfs_enable) {
+        redisLog(REDIS_NOTICE, "stop redis aof, close hdfs file and connect");
+        if (server.aof_hdfs_fs != NULL) {
+            if (server.aof_hdfs_fd != NULL) {
+                if (hdfs_close(server.aof_hdfs_fs, server.aof_hdfs_fd) < 0) {
+                    redisLog(REDIS_WARNING, "hdfs close file error, %d", errno);
+                }
+                server.aof_hdfs_fd = NULL;
+            }
+            if (hdfs_disconnect(server.aof_hdfs_fs) < 0) {
+                redisLog(REDIS_WARNING, "hdfs disconnect error, %d", errno);
+            }
+            server.aof_hdfs_fs = NULL;
+        }
+    }
 
     server.aof_fd = -1;
     server.aof_selected_db = -1;
@@ -197,6 +229,16 @@ int startAppendOnly(void) {
         redisLog(REDIS_WARNING,"Redis needs to enable the AOF but can't open the append only file: %s",strerror(errno));
         return REDIS_ERR;
     }
+
+    if (server.backup_hdfs_enable) {
+        /* init hdfs file system and open file */
+        redisLog(REDIS_WARNING, "startAppendOnly|backup_hdfs_enable on and aof on, init hdfs fs");
+        server.aof_hdfs_fs = hdfs_connect();
+        if (server.aof_hdfs_fs != NULL) {
+            server.aof_hdfs_fd = hdfs_openaof(server.aof_hdfs_fs, HDFS_AOF_FILE, O_WRONLY|O_APPEND, "startAppendOnly|");
+        }
+    }
+
     if (rewriteAppendOnlyFileBackground() == REDIS_ERR) {
         close(server.aof_fd);
         redisLog(REDIS_WARNING,"Redis needs to enable the AOF but can't trigger a background AOF rewrite operation. Check the above logs for more info about the error.");
@@ -454,7 +496,8 @@ sds catAppendOnlyExpireAtCommand(sds buf, struct redisCommand *cmd, robj *key, r
 void feedAppendOnlyFile(struct redisCommand *cmd, int dictid, robj **argv, int argc) {
     sds buf = sdsempty();
     robj *tmpargv[3];
-
+    int size;
+    redisLog(REDIS_DEBUG, "feedAppendOnlyFile");
     /* The DB this command was targeting is not the same as the last command
      * we appended. To issue a SELECT command is needed. */
     if (dictid != server.aof_selected_db) {
@@ -475,7 +518,7 @@ void feedAppendOnlyFile(struct redisCommand *cmd, int dictid, robj **argv, int a
         tmpargv[0] = createStringObject("SET",3);
         tmpargv[1] = argv[1];
         tmpargv[2] = argv[3];
-        buf = catAppendOnlyGenericCommand(buf,3,tmpargv);
+        buf = catAppendOnlyGenericCommand(buf, 3, tmpargv);
         decrRefCount(tmpargv[0]);
         buf = catAppendOnlyExpireAtCommand(buf,cmd,argv[1],argv[2]);
     } else {
@@ -488,8 +531,17 @@ void feedAppendOnlyFile(struct redisCommand *cmd, int dictid, robj **argv, int a
     /* Append to the AOF buffer. This will be flushed on disk just before
      * of re-entering the event loop, so before the client will get a
      * positive reply about the operation performed. */
-    if (server.aof_state == REDIS_AOF_ON)
-        server.aof_buf = sdscatlen(server.aof_buf,buf,sdslen(buf));
+    if (server.aof_state == REDIS_AOF_ON) {
+        size = sdslen(buf);
+        server.aof_buf = sdscatlen(server.aof_buf, buf, size);
+        if (server.backup_hdfs_enable) {
+            if (server.aof_hdfs_fs != NULL && server.aof_hdfs_fd != NULL) {
+                redisLog(REDIS_DEBUG, "aof write to hdfs incr");
+                hdfs_write(server.aof_hdfs_fs, server.aof_hdfs_fd, buf, size);
+                hdfs_flush(server.aof_hdfs_fs, server.aof_hdfs_fd);
+            }
+        }
+    }
 
     /* If a background append only file rewriting is in progress we want to
      * accumulate the differences between the child DB and the current one
@@ -965,6 +1017,7 @@ int rewriteAppendOnlyFile(char *filename) {
     rio aof;
     FILE *fp;
     char tmpfile[256];
+    char tmpAOF[256];
     int j;
     long long now = mstime();
 
@@ -978,6 +1031,12 @@ int rewriteAppendOnlyFile(char *filename) {
     }
 
     rioInitWithFile(&aof,fp);
+    if (server.backup_hdfs_enable) {
+        aof.hdfsFS = hdfs_connect();
+        if (aof.hdfsFS != NULL) {
+            aof.hdfsFile = hdfs_openaof(aof.hdfsFS,HDFS_AOF_TMP, O_WRONLY, "rewriteAppendOnlyFile|");
+        }
+    }
     if (server.aof_rewrite_incremental_fsync)
         rioSetAutoSync(&aof,REDIS_AOF_AUTOSYNC_BYTES);
     for (j = 0; j < server.dbnum; j++) {
@@ -992,7 +1051,7 @@ int rewriteAppendOnlyFile(char *filename) {
         }
 
         /* SELECT the new DB */
-        if (rioWrite(&aof,selectcmd,sizeof(selectcmd)-1) == 0) goto werr;
+        if (rioWriteRaw(&aof,selectcmd,sizeof(selectcmd)-1) == 0) goto werr;
         if (rioWriteBulkLongLong(&aof,j) == 0) goto werr;
 
         /* Iterate this DB writing every entry */
@@ -1014,7 +1073,7 @@ int rewriteAppendOnlyFile(char *filename) {
             if (o->type == REDIS_STRING) {
                 /* Emit a SET command */
                 char cmd[]="*3\r\n$3\r\nSET\r\n";
-                if (rioWrite(&aof,cmd,sizeof(cmd)-1) == 0) goto werr;
+                if (rioWriteRaw(&aof,cmd,sizeof(cmd)-1) == 0) goto werr;
                 /* Key and value */
                 if (rioWriteBulkObject(&aof,&key) == 0) goto werr;
                 if (rioWriteBulkObject(&aof,o) == 0) goto werr;
@@ -1032,7 +1091,7 @@ int rewriteAppendOnlyFile(char *filename) {
             /* Save the expire time */
             if (expiretime != -1) {
                 char cmd[]="*3\r\n$9\r\nPEXPIREAT\r\n";
-                if (rioWrite(&aof,cmd,sizeof(cmd)-1) == 0) goto werr;
+                if (rioWriteRaw(&aof,cmd,sizeof(cmd)-1) == 0) goto werr;
                 if (rioWriteBulkObject(&aof,&key) == 0) goto werr;
                 if (rioWriteBulkLongLong(&aof,expiretime) == 0) goto werr;
             }
@@ -1054,11 +1113,48 @@ int rewriteAppendOnlyFile(char *filename) {
         return REDIS_ERR;
     }
     redisLog(REDIS_NOTICE,"SYNC append only file rewrite performed");
+
+    if (server.backup_hdfs_enable) {
+        if (aof.hdfsFS != NULL) {
+            if (aof.hdfsFile != NULL) {
+                if (hdfs_close(aof.hdfsFS, aof.hdfsFile) < 0) {
+                    redisLog(REDIS_WARNING, "rewriteAppendOnlyFile|hdfs close file error, %d", errno);
+                }
+            }
+            if (hdfs_exists(aof.hdfsFS, HDFS_AOF_BG_TMP) == 0) {
+                redisLog(REDIS_VERBOSE, "file[%s] exists", HDFS_AOF_BG_TMP);
+                snprintf(tmpAOF, 256, "%s.%lld", HDFS_AOF_BG_TMP, server.mstime);
+                if (hdfs_rename(aof.hdfsFS, HDFS_AOF_BG_TMP, tmpAOF)) {
+                    redisLog(REDIS_WARNING, "rewriteAppendOnlyFile|hdfs rename tmpbgaof tmpfile error, %d", errno);
+                }
+            }
+            if (hdfs_rename(aof.hdfsFS, HDFS_AOF_TMP, HDFS_AOF_BG_TMP)) {
+                redisLog(REDIS_WARNING, "rewriteAppendOnlyFile|hdfs rename bgaof tmpfile error, %d", errno);
+            }
+            if (hdfs_disconnect(aof.hdfsFS) < 0) {
+                redisLog(REDIS_WARNING, "rewriteAppendOnlyFile|hdfs disconnect error, %d", errno);
+            }
+        }
+    }
+
     return REDIS_OK;
 
 werr:
     fclose(fp);
     unlink(tmpfile);
+    if (server.backup_hdfs_enable) {
+        if (aof.hdfsFS != NULL) {
+            if (aof.hdfsFile != NULL) {
+                if (hdfs_close(aof.hdfsFS, aof.hdfsFile) < 0) {
+                    redisLog(REDIS_WARNING, "rewriteAppendOnlyFile|werr hdfs close file error, %d", errno);
+                }
+            }
+            if (hdfs_disconnect(aof.hdfsFS) < 0) {
+                redisLog(REDIS_WARNING, "rewriteAppendOnlyFile|werr hdfs disconnect error, %d", errno);
+            }
+        }
+    }
+
     redisLog(REDIS_WARNING,"Write error writing append only file on disk: %s", strerror(errno));
     if (di) dictReleaseIterator(di);
     return REDIS_ERR;
@@ -1176,6 +1272,10 @@ void backgroundRewriteDoneHandler(int exitcode, int bysignal) {
         char tmpfile[256];
         long long now = ustime();
         mstime_t latency;
+        hdfsFile newHdfsFile = NULL;
+        hdfsFS   newHdfsFS = NULL;
+        hdfsFile oldHdfsFile = NULL;
+        hdfsFS   oldHdfsFS = NULL;
 
         redisLog(REDIS_NOTICE,
             "Background AOF rewrite terminated with success");
@@ -1192,7 +1292,14 @@ void backgroundRewriteDoneHandler(int exitcode, int bysignal) {
             goto cleanup;
         }
 
-        if (aofRewriteBufferWrite(newfd) == -1) {
+        if (server.backup_hdfs_enable) {
+            newHdfsFS = hdfs_connect();
+            if (newHdfsFS != NULL) {
+                newHdfsFile = hdfs_openaof(newHdfsFS, HDFS_AOF_BG_TMP, O_WRONLY|O_APPEND, "backgroundRewriteDoneHandler|");
+            }
+        }
+
+        if (aofRewriteBufferWrite(newfd, newHdfsFS, newHdfsFile) == -1) {
             redisLog(REDIS_WARNING,
                 "Error trying to flush the parent diff to the rewritten AOF: %s", strerror(errno));
             close(newfd);
@@ -1251,7 +1358,18 @@ void backgroundRewriteDoneHandler(int exitcode, int bysignal) {
                 "Error trying to rename the temporary AOF file: %s", strerror(errno));
             close(newfd);
             if (oldfd != -1) close(oldfd);
+            hdfs_destory(newHdfsFS, newHdfsFile);
             goto cleanup;
+        }
+        if (server.backup_hdfs_enable) {
+            char renameFile[256] = "";
+            snprintf(renameFile, 256, "%s.%lld", HDFS_AOF_BG_TMP, server.mstime);
+            if (hdfs_rename(newHdfsFS, HDFS_AOF_FILE, renameFile) < 0) {
+                redisLog(REDIS_WARNING, "backgroundRewriteDoneHandler| aof rename backup error, [%d]", errno);
+            }
+            if (hdfs_rename(newHdfsFS, HDFS_AOF_BG_TMP, HDFS_AOF_FILE) < 0) {
+                redisLog(REDIS_WARNING, "backgroundRewriteDoneHandler| aof rename error, [%d]", errno);
+            }
         }
         latencyEndMonitor(latency);
         latencyAddSampleIfNeeded("aof-rename",latency);
@@ -1260,10 +1378,20 @@ void backgroundRewriteDoneHandler(int exitcode, int bysignal) {
             /* AOF disabled, we don't need to set the AOF file descriptor
              * to this new file, so we can close it. */
             close(newfd);
+            hdfs_destory(newHdfsFS, newHdfsFile);
         } else {
             /* AOF enabled, replace the old fd with the new one. */
             oldfd = server.aof_fd;
             server.aof_fd = newfd;
+
+            oldHdfsFS = server.aof_hdfs_fs;
+            oldHdfsFile = server.aof_hdfs_fd;
+
+            server.aof_hdfs_fs = newHdfsFS;
+            server.aof_hdfs_fd = newHdfsFile;
+
+            hdfs_destory(oldHdfsFS, oldHdfsFile);
+
             if (server.aof_fsync == AOF_FSYNC_ALWAYS)
                 aof_fsync(newfd);
             else if (server.aof_fsync == AOF_FSYNC_EVERYSEC)

@@ -82,6 +82,8 @@ struct _rio {
             sds buf;
         } fdset;
     } io;
+    void* hdfsFS;
+    void* hdfsFile;
 };
 
 typedef struct _rio rio;

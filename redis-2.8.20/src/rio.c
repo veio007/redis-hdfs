@@ -54,6 +54,7 @@
 #include "crc64.h"
 #include "config.h"
 #include "redis.h"
+#include "hdfs.h"
 
 /* ------------------------- Buffer I/O implementation ----------------------- */
 
@@ -94,7 +95,9 @@ static const rio rioBufferIO = {
     0,              /* current checksum */
     0,              /* bytes read or written */
     0,              /* read/write chunk size */
-    { { NULL, 0 } } /* union for io-specific vars */
+    { { NULL, 0 } }, /* union for io-specific vars */
+    NULL,
+    NULL
 };
 
 void rioInitWithBuffer(rio *r, sds s) {
@@ -147,7 +150,9 @@ static const rio rioFileIO = {
     0,              /* current checksum */
     0,              /* bytes read or written */
     0,              /* read/write chunk size */
-    { { NULL, 0 } } /* union for io-specific vars */
+    { { NULL, 0 } }, /* union for io-specific vars */
+    NULL,
+    NULL
 };
 
 void rioInitWithFile(rio *r, FILE *fp) {
@@ -155,6 +160,8 @@ void rioInitWithFile(rio *r, FILE *fp) {
     r->io.file.fp = fp;
     r->io.file.buffered = 0;
     r->io.file.autosync = 0;
+    r->hdfsFS = NULL;
+    r->hdfsFile = NULL;
 }
 
 /* ------------------- File descriptors set implementation ------------------- */
@@ -260,7 +267,9 @@ static const rio rioFdsetIO = {
     0,              /* current checksum */
     0,              /* bytes read or written */
     0,              /* read/write chunk size */
-    { { NULL, 0 } } /* union for io-specific vars */
+    { { NULL, 0 } }, /* union for io-specific vars */
+    NULL,
+    NULL
 };
 
 void rioInitWithFdset(rio *r, int *fds, int numfds) {
@@ -318,6 +327,7 @@ size_t rioWriteBulkCount(rio *r, char prefix, int count) {
     cbuf[clen++] = '\r';
     cbuf[clen++] = '\n';
     if (rioWrite(r,cbuf,clen) == 0) return 0;
+    hdfs_write_raw(r,(const void*)cbuf,clen);
     return clen;
 }
 
@@ -327,7 +337,9 @@ size_t rioWriteBulkString(rio *r, const char *buf, size_t len) {
 
     if ((nwritten = rioWriteBulkCount(r,'$',len)) == 0) return 0;
     if (len > 0 && rioWrite(r,buf,len) == 0) return 0;
+    hdfs_write_raw(r,buf,len);
     if (rioWrite(r,"\r\n",2) == 0) return 0;
+    hdfs_write_raw(r, "\r\n",2);
     return nwritten+len+2;
 }
 

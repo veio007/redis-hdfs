@@ -31,6 +31,7 @@
 #include "lzf.h"    /* LZF compression library */
 #include "zipmap.h"
 #include "endianconv.h"
+#include "hdfs.h"
 
 #include <math.h>
 #include <sys/types.h>
@@ -40,9 +41,11 @@
 #include <arpa/inet.h>
 #include <sys/stat.h>
 
-static int rdbWriteRaw(rio *rdb, void *p, size_t len) {
+int rdbWriteRaw(rio *rdb, void *p, size_t len) {
     if (rdb && rioWrite(rdb,p,len) == 0)
         return -1;
+
+    hdfs_write_raw(rdb, p, len);
     return len;
 }
 
@@ -679,7 +682,7 @@ int rdbSaveRio(rio *rdb, int *error) {
      * loading code skips the check in this case. */
     cksum = rdb->cksum;
     memrev64ifbe(&cksum);
-    if (rioWrite(rdb,&cksum,8) == 0) goto werr;
+    if (rdbWriteRaw(rdb,&cksum,8) == 0) goto werr;
     return REDIS_OK;
 
 werr:
@@ -730,6 +733,15 @@ int rdbSave(char *filename) {
     }
 
     rioInitWithFile(&rdb,fp);
+    if (server.backup_hdfs_enable) {
+        /* init hdfs file system and open file */
+        redisLog(REDIS_DEBUG,"backup_hdfs_enable is on, save file to hdfs too");
+        rdb.hdfsFS = hdfs_connect();
+        if (rdb.hdfsFS != NULL) {
+            rdb.hdfsFile = hdfs_openrdb(rdb.hdfsFS);
+        }
+    }
+
     if (rdbSaveRio(&rdb,&error) == REDIS_ERR) {
         errno = error;
         goto werr;
@@ -739,6 +751,21 @@ int rdbSave(char *filename) {
     if (fflush(fp) == EOF) goto werr;
     if (fsync(fileno(fp)) == -1) goto werr;
     if (fclose(fp) == EOF) goto werr;
+
+    if (rdb.hdfsFS != NULL) {
+        if (rdb.hdfsFile != NULL) {
+            redisLog(REDIS_DEBUG,"hdfsCloseFile");
+            if (hdfs_close(rdb.hdfsFS, rdb.hdfsFile) < 0) {
+                redisLog(REDIS_WARNING, "hdfsCloseFile error, %d", errno);
+            }
+        }
+        redisLog(REDIS_DEBUG,"hdfsDisconnect");
+        if (hdfsDisconnect(rdb.hdfsFS) <0){
+            redisLog(REDIS_WARNING,"hdfsDisconnect error, %d", errno);
+        }
+    }
+
+
 
     /* Use RENAME to make sure the DB file is changed atomically only
      * if the generate DB file is ok. */
@@ -786,6 +813,7 @@ int rdbSaveBackground(char *filename) {
                     private_dirty/(1024*1024));
             }
         }
+
         exitFromChild((retval == REDIS_OK) ? 0 : 1);
     } else {
         /* Parent */

@@ -392,6 +392,13 @@ typedef long long mstime_t; /* millisecond time type. */
 #define redisAssert(_e) ((_e)?(void)0 : (_redisAssert(#_e,__FILE__,__LINE__),_exit(1)))
 #define redisPanic(_e) _redisPanic(#_e,__FILE__,__LINE__),_exit(1)
 
+/* backup data to hdfs switch */
+#define REDIS_HDFS_OFF 0
+#define REDIS_HDFS_ON 1
+
+#define HDFS_AOF_FILE   "db.aof"
+#define HDFS_AOF_TMP    "tmp.aof"
+#define HDFS_AOF_BG_TMP "tmp.bg.aof"
 /*-----------------------------------------------------------------------------
  * Data types
  *----------------------------------------------------------------------------*/
@@ -833,6 +840,13 @@ struct redisServer {
     int assert_line;
     int bug_report_start; /* True if bug report header was already logged. */
     int watchdog_period;  /* Software watchdog period in ms. 0 = off */
+    int backup_hdfs_enable;
+    char *backup_hdfs_host;
+    int backup_hdfs_port;
+    char *backup_hdfs_user;
+    char *backup_hdfs_path;
+    void *aof_hdfs_fs;
+    void *aof_hdfs_fd;
 };
 
 typedef struct pubsubPattern {

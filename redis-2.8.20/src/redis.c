@@ -31,6 +31,7 @@
 #include "slowlog.h"
 #include "bio.h"
 #include "latency.h"
+#include "hdfs.h"
 
 #include <time.h>
 #include <signal.h>
@@ -1384,6 +1385,13 @@ void initServerConfig(void) {
     server.lua_timedout = 0;
     server.next_client_id = 1; /* Client IDs, start from 1 .*/
     server.loading_process_events_interval_bytes = (1024*1024*2);
+    server.aof_hdfs_fs = NULL;
+    server.aof_hdfs_fd = NULL;
+    server.backup_hdfs_enable = REDIS_HDFS_OFF;
+    server.backup_hdfs_host = NULL;
+    server.backup_hdfs_port = 0;
+    server.backup_hdfs_user = NULL;
+    server.backup_hdfs_path = NULL;
 
     updateLRUClock();
     resetServerSaveParams();
@@ -1755,11 +1763,21 @@ void initServer(void) {
     /* Open the AOF file if needed. */
     if (server.aof_state == REDIS_AOF_ON) {
         server.aof_fd = open(server.aof_filename,
-                               O_WRONLY|O_APPEND|O_CREAT,0644);
+                             O_WRONLY | O_APPEND | O_CREAT, 0644);
         if (server.aof_fd == -1) {
             redisLog(REDIS_WARNING, "Can't open the append-only file: %s",
-                strerror(errno));
+                     strerror(errno));
             exit(1);
+        }
+
+        if (server.backup_hdfs_enable) {
+            /* init hdfs file system and open file */
+            redisLog(REDIS_WARNING, "initServer|backup_hdfs_enable on and aof on, init hdfs fs");
+            server.aof_hdfs_fs = hdfs_connect();
+            if (server.aof_hdfs_fs != NULL) {
+                server.aof_hdfs_fd = hdfs_openaof(server.aof_hdfs_fs, HDFS_AOF_FILE, O_WRONLY,
+                                                  "initServer|");
+            }
         }
     }
 
@@ -2219,6 +2237,20 @@ int prepareForShutdown(int flags) {
         /* Append only file: fsync() the AOF and exit */
         redisLog(REDIS_NOTICE,"Calling fsync() on the AOF file.");
         aof_fsync(server.aof_fd);
+        if (server.backup_hdfs_enable) {
+            redisLog(REDIS_NOTICE, "shutdown redis, close hdfs file and connect");
+            if (server.aof_hdfs_fs != NULL) {
+                if (server.aof_hdfs_fd != NULL) {
+                    if (hdfs_close(server.aof_hdfs_fs, server.aof_hdfs_fd) < 0) {
+                        redisLog(REDIS_WARNING, "shutdown redis, hdfs close file error, %d", errno);
+                    }
+
+                    if (hdfs_disconnect(server.aof_hdfs_fs) < 0) {
+                        redisLog(REDIS_WARNING, "shutdown redis, hdfs disconnect error, %d", errno);
+                    }
+                }
+            }
+        }
     }
     if ((server.saveparamslen > 0 && !nosave) || save) {
         redisLog(REDIS_NOTICE,"Saving the final RDB snapshot before exiting.");
