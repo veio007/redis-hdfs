@@ -1,3 +1,19 @@
+redis-hdfs
+save redis data to hdfs(rdb/aof)
+base from redis 2.8.20
+
+deps:
+pivotalrd-libhdfs3-2.2.31
+	krb5-1.14.3
+	boost_1_61_0
+	libgsasl-1.6.0
+	protobuf-2.6.1
+	libuuid
+	byacc
+	libxml2
+	bzip2
+
+-------------------------------------------
 Where to find complete Redis documentation?
 -------------------------------------------
 
