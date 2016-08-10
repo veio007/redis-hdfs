@@ -308,6 +308,13 @@ void flushAppendOnlyFile(int force) {
 
     latencyStartMonitor(latency);
     nwritten = write(server.aof_fd,server.aof_buf,sdslen(server.aof_buf));
+    if (server.backup_hdfs_enable) {
+        if (server.aof_hdfs_fs != NULL && server.aof_hdfs_fd != NULL) {
+            redisLog(REDIS_DEBUG, "aof write to hdfs incr");
+            hdfs_write(server.aof_hdfs_fs, server.aof_hdfs_fd, server.aof_buf, sdslen(server.aof_buf));
+            hdfs_flush(server.aof_hdfs_fs, server.aof_hdfs_fd);
+        }
+    }
     latencyEndMonitor(latency);
     /* We want to capture different events for delayed writes:
      * when the delay happens with a pending fsync, or with a saving child
@@ -534,13 +541,6 @@ void feedAppendOnlyFile(struct redisCommand *cmd, int dictid, robj **argv, int a
     if (server.aof_state == REDIS_AOF_ON) {
         size = sdslen(buf);
         server.aof_buf = sdscatlen(server.aof_buf, buf, size);
-        if (server.backup_hdfs_enable) {
-            if (server.aof_hdfs_fs != NULL && server.aof_hdfs_fd != NULL) {
-                redisLog(REDIS_DEBUG, "aof write to hdfs incr");
-                hdfs_write(server.aof_hdfs_fs, server.aof_hdfs_fd, buf, size);
-                hdfs_flush(server.aof_hdfs_fs, server.aof_hdfs_fd);
-            }
-        }
     }
 
     /* If a background append only file rewriting is in progress we want to
@@ -1032,9 +1032,11 @@ int rewriteAppendOnlyFile(char *filename) {
 
     rioInitWithFile(&aof,fp);
     if (server.backup_hdfs_enable) {
-        aof.hdfsFS = hdfs_connect();
+        aof.hdfsFS = server.aof_hdfs_fs;
         if (aof.hdfsFS != NULL) {
             aof.hdfsFile = hdfs_openaof(aof.hdfsFS,HDFS_AOF_TMP, O_WRONLY, "rewriteAppendOnlyFile|");
+        } else {
+            redisLog(REDIS_WARNING, "rewriteAppendOnlyFile|hdfsFs is null");
         }
     }
     if (server.aof_rewrite_incremental_fsync)
@@ -1130,9 +1132,6 @@ int rewriteAppendOnlyFile(char *filename) {
             }
             if (hdfs_rename(aof.hdfsFS, HDFS_AOF_TMP, HDFS_AOF_BG_TMP)) {
                 redisLog(REDIS_WARNING, "rewriteAppendOnlyFile|hdfs rename bgaof tmpfile error, %d", errno);
-            }
-            if (hdfs_disconnect(aof.hdfsFS) < 0) {
-                redisLog(REDIS_WARNING, "rewriteAppendOnlyFile|hdfs disconnect error, %d", errno);
             }
         }
     }
@@ -1272,10 +1271,8 @@ void backgroundRewriteDoneHandler(int exitcode, int bysignal) {
         char tmpfile[256];
         long long now = ustime();
         mstime_t latency;
-        hdfsFile newHdfsFile = NULL;
-        hdfsFS   newHdfsFS = NULL;
-        hdfsFile oldHdfsFile = NULL;
-        hdfsFS   oldHdfsFS = NULL;
+        hdfsFile newHdfsFile;
+        hdfsFS   newHdfsFS;
 
         redisLog(REDIS_NOTICE,
             "Background AOF rewrite terminated with success");
@@ -1293,17 +1290,28 @@ void backgroundRewriteDoneHandler(int exitcode, int bysignal) {
         }
 
         if (server.backup_hdfs_enable) {
-            newHdfsFS = hdfs_connect();
-            if (newHdfsFS != NULL) {
-                newHdfsFile = hdfs_openaof(newHdfsFS, HDFS_AOF_BG_TMP, O_WRONLY|O_APPEND, "backgroundRewriteDoneHandler|");
+            if (server.aof_hdfs_fs != NULL) {
+                newHdfsFile = hdfs_openaof(server.aof_hdfs_fs, HDFS_AOF_BG_TMP, O_WRONLY | O_APPEND,
+                                           "backgroundRewriteDoneHandler|");
+            } else {
+                redisLog(REDIS_WARNING, "backgroundRewriteDoneHandler|newHdfsFS is null");
             }
         }
-
-        if (aofRewriteBufferWrite(newfd, newHdfsFS, newHdfsFile) == -1) {
+        if (aofRewriteBufferWrite(newfd, server.aof_hdfs_fs, newHdfsFile) == -1) {
             redisLog(REDIS_WARNING,
                 "Error trying to flush the parent diff to the rewritten AOF: %s", strerror(errno));
             close(newfd);
+            hdfs_destory(server.aof_hdfs_fs, newHdfsFile);
             goto cleanup;
+        }
+        if (server.backup_hdfs_enable) {
+            if (server.aof_hdfs_fs != NULL && newHdfsFile != NULL) {
+                if (hdfs_close(server.aof_hdfs_fs, newHdfsFile) < 0) {
+                    redisLog(REDIS_WARNING, "hdfs close file error, %d", errno);
+                }
+            } else {
+                redisLog(REDIS_WARNING, "hdfs close file unknow, fs/file is null, %d, %d", server.aof_hdfs_fs != NULL, newHdfsFile != NULL);
+            }
         }
         latencyEndMonitor(latency);
         latencyAddSampleIfNeeded("aof-rewrite-diff-write",latency);
@@ -1358,17 +1366,26 @@ void backgroundRewriteDoneHandler(int exitcode, int bysignal) {
                 "Error trying to rename the temporary AOF file: %s", strerror(errno));
             close(newfd);
             if (oldfd != -1) close(oldfd);
-            hdfs_destory(newHdfsFS, newHdfsFile);
             goto cleanup;
         }
         if (server.backup_hdfs_enable) {
             char renameFile[256] = "";
             snprintf(renameFile, 256, "%s.%lld", HDFS_AOF_BG_TMP, server.mstime);
-            if (hdfs_rename(newHdfsFS, HDFS_AOF_FILE, renameFile) < 0) {
+
+            hdfs_destory(server.aof_hdfs_fs, server.aof_hdfs_fd);
+
+            newHdfsFS = hdfs_connect();
+            if (hdfs_rename(newHdfsFS, HDFS_AOF_FILE, renameFile)) {
                 redisLog(REDIS_WARNING, "backgroundRewriteDoneHandler| aof rename backup error, [%d]", errno);
             }
-            if (hdfs_rename(newHdfsFS, HDFS_AOF_BG_TMP, HDFS_AOF_FILE) < 0) {
+            if (hdfs_rename(newHdfsFS, HDFS_AOF_BG_TMP, HDFS_AOF_FILE)) {
                 redisLog(REDIS_WARNING, "backgroundRewriteDoneHandler| aof rename error, [%d]", errno);
+            }
+            hdfs_disconnect(newHdfsFS);
+            if (server.aof_hdfs_fs != NULL) {
+                newHdfsFile = hdfs_openaof(server.aof_hdfs_fs, HDFS_AOF_FILE, O_WRONLY | O_APPEND, "backgroundRewriteDoneHandler reopen|");
+            } else {
+                redisLog(REDIS_WARNING, "backgroundRewriteDoneHandler reopen| newHdfsFS is null");
             }
         }
         latencyEndMonitor(latency);
@@ -1378,19 +1395,13 @@ void backgroundRewriteDoneHandler(int exitcode, int bysignal) {
             /* AOF disabled, we don't need to set the AOF file descriptor
              * to this new file, so we can close it. */
             close(newfd);
-            hdfs_destory(newHdfsFS, newHdfsFile);
+            hdfs_destory(server.aof_hdfs_fs, newHdfsFile);
         } else {
             /* AOF enabled, replace the old fd with the new one. */
             oldfd = server.aof_fd;
             server.aof_fd = newfd;
-
-            oldHdfsFS = server.aof_hdfs_fs;
-            oldHdfsFile = server.aof_hdfs_fd;
-
-            server.aof_hdfs_fs = newHdfsFS;
             server.aof_hdfs_fd = newHdfsFile;
 
-            hdfs_destory(oldHdfsFS, oldHdfsFile);
 
             if (server.aof_fsync == AOF_FSYNC_ALWAYS)
                 aof_fsync(newfd);

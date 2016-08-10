@@ -753,6 +753,10 @@ static inline int hdfs_chgroot(hdfsFS fs) {
     redisLog(REDIS_VERBOSE,"hdfs chg root dir sucess, dir:[%s]", filename);
     return 0;
 }
+
+static inline int add_path(const char* file, char* fullpath, int size) {
+    snprintf(fullpath, size, "%s%s-%d/%s", server.backup_hdfs_path, server.bindaddr[0], server.port, file);
+}
 static inline hdfsFS hdfs_connect() {
     redisLog(REDIS_VERBOSE,"hdfs connect host:[%s] port:[%d] user:[%s]", server.backup_hdfs_host,
                 server.backup_hdfs_port, server.backup_hdfs_user);
@@ -761,9 +765,9 @@ static inline hdfsFS hdfs_connect() {
     if (fs == NULL) {
         redisLog(REDIS_WARNING,"hdfs connect error [%d]", errno);
     }
-    if (hdfs_chgroot(fs)) {
+    /*if (hdfs_chgroot(fs)) {
         return NULL;
-    }
+    }*/
     return fs;
 }
 static inline int hdfs_disconnect(hdfsFS fs) {
@@ -772,7 +776,7 @@ static inline int hdfs_disconnect(hdfsFS fs) {
 }
 static inline hdfsFile hdfs_openrdb(hdfsFS fs) {
     char tmpfile[256] = "";
-    snprintf(tmpfile, 256, "%lld.rdb", server.mstime);
+    snprintf(tmpfile, 256, "%s%s-%d/%lld.rdb", server.backup_hdfs_path, server.bindaddr[0], server.port, server.mstime);
     redisLog(REDIS_VERBOSE,"hdsf open file [%s]", tmpfile);
 
     hdfsFile out = hdfsOpenFile(fs, tmpfile, O_WRONLY, 0, 0, 0);
@@ -783,11 +787,17 @@ static inline hdfsFile hdfs_openrdb(hdfsFS fs) {
 }
 
 static inline hdfsFile hdfs_openaof(hdfsFS fs,const char* file, int flag, const char* info) {
-    redisLog(REDIS_VERBOSE,"%s hdfs open aof file:[%s]", info, file);
+    char tmpfile[256] = "";
+    snprintf(tmpfile, 256, "%s%s-%d/%s", server.backup_hdfs_path, server.bindaddr[0], server.port, file);
+    redisLog(REDIS_VERBOSE,"%s hdfs open aof file:[%s]", info, tmpfile);
 
-    hdfsFile out = hdfsOpenFile(fs, file, flag, 0, 0, 0);
+    hdfsFile out = hdfsOpenFile(fs, tmpfile, flag, 0, 0, 0);
     if (out == NULL) {
-        redisLog(REDIS_WARNING,"%s hdfs open aof file error, file:[%s] err:[%d]", info, file, errno);
+        redisLog(REDIS_WARNING,"%s hdfs open aof file error, file:[%s] err:[%d], retry", info, tmpfile, errno);
+        out = hdfsOpenFile(fs, tmpfile, flag, 0, 0, 0);
+        if (out == NULL) {
+            redisLog(REDIS_WARNING,"%s hdfs open aof file error, file:[%s] err:[%d]", info, tmpfile, errno);
+        }
     }
     return out;
 }
@@ -819,25 +829,35 @@ static inline void hdfs_write_raw(rio *rdb, const void *p, size_t len) {
 }
 
 static inline int hdfs_rename(hdfsFS fs, const char* oldpath, const char* newpath) {
-    redisLog(REDIS_VERBOSE, "hdfs rename [%s] to [%s]", oldpath, newpath);
-    return hdfsRename(fs, oldpath, newpath);
+    char tmpold[256] = "";
+    char tmpnew[256] = "";
+    snprintf(tmpold, 256, "%s%s-%d/%s", server.backup_hdfs_path, server.bindaddr[0], server.port, oldpath);
+    snprintf(tmpnew, 256, "%s%s-%d/%s", server.backup_hdfs_path, server.bindaddr[0], server.port, newpath);
+    redisLog(REDIS_VERBOSE, "hdfs rename [%s] to [%s]", tmpold, tmpnew);
+    return hdfsRename(fs, tmpold, tmpnew);
 }
 
 static inline int hdfs_exists(hdfsFS fs, const char* file) {
-    return hdfsExists(fs, file);
+    char tmpfile[256] = "";
+    snprintf(tmpfile, 256, "%s%s-%d/%s", server.backup_hdfs_path, server.bindaddr[0], server.port, file);
+    return hdfsExists(fs, tmpfile);
 }
 
 static inline int hdfs_destory(hdfsFS fs, hdfsFile file) {
     if (fs != NULL) {
         if (file != NULL) {
-            if (hdfsCloseFile(fs, file) < 0) {
+            if (hdfs_close(fs, file)) {
                 redisLog(REDIS_WARNING, "hdfs close file error, %d", errno);
             }
+        } else {
+            redisLog(REDIS_WARNING, "hdfs close file, file is null");
         }
-        if (hdfsDisconnect(fs) < 0) {
+        /*if (hdfs_disconnect(fs) < 0) {
             redisLog(REDIS_WARNING, "hdfs disconnect error, %d", errno);
             return -1;
-        }
+        }*/
+    } else {
+        redisLog(REDIS_WARNING, "hdfs close file, fs is null");
     }
     return 0;
 }

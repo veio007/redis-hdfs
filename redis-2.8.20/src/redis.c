@@ -1775,7 +1775,7 @@ void initServer(void) {
             redisLog(REDIS_WARNING, "initServer|backup_hdfs_enable on and aof on, init hdfs fs");
             server.aof_hdfs_fs = hdfs_connect();
             if (server.aof_hdfs_fs != NULL) {
-                server.aof_hdfs_fd = hdfs_openaof(server.aof_hdfs_fs, HDFS_AOF_FILE, O_WRONLY,
+                server.aof_hdfs_fd = hdfs_openaof(server.aof_hdfs_fs, HDFS_AOF_FILE, O_WRONLY | O_APPEND,
                                                   "initServer|");
             }
         }
